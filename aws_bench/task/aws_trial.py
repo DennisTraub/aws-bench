@@ -16,9 +16,11 @@ from harbor.agents.oracle import OracleAgent
 from harbor.models.task.task import Task
 from harbor.models.trial.config import TrialConfig
 from harbor.models.trial.paths import TrialPaths
+from harbor.tasks.client import TaskClient, TaskDownloadResult
 from harbor.trial.single_step import SingleStepTrial
 
 from aws_bench.account_management.manager import AccountManager
+from aws_bench.constants import TASK_CACHE_DIR
 from aws_bench.dataset.models import RoleType, ScriptType
 from aws_bench.dataset.task_config import AwsBenchTask, ConcurrencyMode, PhaseScript
 from aws_bench.exceptions import AccountContaminatedError, OperationCancelled
@@ -79,7 +81,13 @@ class AwsBenchSingleStepTrial(SingleStepTrial):
     config: AwsBenchTrialConfig
     task: AwsBenchTask
 
-    def __init__(self, config: TrialConfig, *, _task: Task | None = None) -> None:
+    def __init__(
+        self,
+        config: TrialConfig,
+        *,
+        _task: Task | None = None,
+        _task_download_result: TaskDownloadResult,
+    ) -> None:
         """Initialize state before the base init so teardown paths can read it.
 
         Teardown can run before ``_prepare`` (failure/cancel during setup), so
@@ -90,7 +98,7 @@ class AwsBenchSingleStepTrial(SingleStepTrial):
         # Gates post-invoke: skipped if setup never produced a running container.
         self._agent_container_started = False
         self._account_manager = AccountManager()
-        super().__init__(config, _task=_task)
+        super().__init__(config, _task=_task, _task_download_result=_task_download_result)
 
     def _init_logger(self) -> None:
         """Give trial.log the aws-bench file format, replacing Harbor's bare handler.
@@ -467,4 +475,20 @@ class AwsBenchTrial:
                 "multi-step AWS tasks are not yet supported (per-step pre/post-invoke "
                 "credentialing is undefined)."
             )
-        return AwsBenchSingleStepTrial(config, _task=task)
+        download_result = await cls._resolve_download_result(config)
+        return AwsBenchSingleStepTrial(config, _task=task, _task_download_result=download_result)
+
+    @staticmethod
+    async def _resolve_download_result(config: TrialConfig) -> TaskDownloadResult:
+        """The ``TaskDownloadResult`` harbor's trial lock records for this task.
+
+        Mirrors ``Trial._load_task``. A local task resolves to its own path without
+        I/O. A git task repeats the download ``AwsBenchTask.from_config`` made, which
+        is a cache hit for a sha-pinned ref with ``overwrite`` off.
+        """
+        batch = await TaskClient().download_tasks(
+            task_ids=[config.task.get_task_id()],
+            overwrite=config.task.overwrite,
+            output_dir=config.task.download_dir or TASK_CACHE_DIR,
+        )
+        return batch.results[0]

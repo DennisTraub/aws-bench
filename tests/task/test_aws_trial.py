@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from harbor.agents.oracle import OracleAgent
+from harbor.models.trial.config import TaskConfig, TrialConfig
 from harbor.trial.single_step import SingleStepTrial
 from harbor.trial.trial import Trial
 
@@ -154,7 +155,10 @@ async def test_create_dispatches_single_step(mocker):
     task = SimpleNamespace(has_steps=False)
     mocker.patch.object(AwsBenchTask, "from_config", AsyncMock(return_value=task))
     # Patch the base init out to skip the heavy Docker / agent-factory chain.
-    mocker.patch.object(SingleStepTrial, "__init__", lambda self, config, _task=None: None)
+    mocker.patch.object(SingleStepTrial, "__init__", lambda self, config, **kwargs: None)
+    mocker.patch.object(
+        AwsBenchTrial, "_resolve_download_result", AsyncMock(return_value=MagicMock())
+    )
     trial = await AwsBenchTrial.create(MagicMock())
     assert isinstance(trial, AwsBenchSingleStepTrial)
 
@@ -165,6 +169,21 @@ async def test_create_multi_step_raises_not_implemented(mocker):
     mocker.patch.object(AwsBenchTask, "from_config", AsyncMock(return_value=task))
     with pytest.raises(NotImplementedError, match="multi-step"):
         await AwsBenchTrial.create(MagicMock())
+
+
+@pytest.mark.asyncio
+async def test_resolve_download_result_uses_task_settings(tmp_path, mocker):
+    expected = SimpleNamespace(path=tmp_path)
+    download_tasks = AsyncMock(return_value=SimpleNamespace(results=[expected]))
+    mocker.patch.object(
+        aws_trial, "TaskClient", return_value=SimpleNamespace(download_tasks=download_tasks)
+    )
+    config = TrialConfig(task=TaskConfig(path=tmp_path, overwrite=True))
+    result = await AwsBenchTrial._resolve_download_result(config)
+    assert result is expected
+    download_tasks.assert_awaited_once_with(
+        task_ids=[config.task.get_task_id()], overwrite=True, output_dir=aws_trial.TASK_CACHE_DIR
+    )
 
 
 # --- placeholder substitution into the instruction ------------------------
@@ -866,7 +885,7 @@ def test_init_sets_aws_attrs_before_base_init(tmp_path, mocker):
     run()-finally teardown path reads.
     """
 
-    def raising_init(self, config, *, _task=None):
+    def raising_init(self, config, *, _task=None, _task_download_result=None):
         raise RuntimeError("base init blew up")
 
     mocker.patch.object(SingleStepTrial, "__init__", raising_init)
@@ -875,7 +894,7 @@ def test_init_sets_aws_attrs_before_base_init(tmp_path, mocker):
     # still in hand after the base init raises.
     trial = AwsBenchSingleStepTrial.__new__(AwsBenchSingleStepTrial)
     with pytest.raises(RuntimeError, match="base init blew up"):
-        trial.__init__(MagicMock(), _task=MagicMock())
+        trial.__init__(MagicMock(), _task=MagicMock(), _task_download_result=MagicMock())
 
     # The subclass set these before delegating to the (now-failed) base init.
     assert trial._aws_placeholders == {}
