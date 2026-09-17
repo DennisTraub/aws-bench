@@ -5,9 +5,10 @@ Harbor's built-in ``Codex`` agent only knows how to talk to OpenAI: it writes
 configured, so codex falls back to its default OpenAI provider. To drive Codex
 against Amazon Bedrock, two things are missing, and this subclass fills both:
 
-1. ``model_provider = "amazon-bedrock"`` must be written into the *container's*
-   ``$CODEX_HOME/config.toml``. Without it codex never routes to Bedrock,
-   regardless of which env vars are set. This cannot be supplied via ``-ae``.
+1. ``model_provider = "amazon-bedrock"`` must be present in the *container's*
+   ``$CODEX_HOME/config.toml``, which harbor renders and uploads from the
+   effective config dict. Without it codex never routes to Bedrock, regardless
+   of which env vars are set. This cannot be supplied via ``-ae``.
 2. The Bedrock auth env (``AWS_BEARER_TOKEN_BEDROCK`` + ``AWS_REGION``) must be
    forwarded from the host into the codex subprocess. Harbor's Codex does not.
 
@@ -23,6 +24,7 @@ from __future__ import annotations
 
 import os
 import shlex
+from typing import Any
 
 from harbor.agents.installed.codex import Codex as _HarborCodex
 from harbor.environments.base import BaseEnvironment
@@ -85,13 +87,14 @@ class Codex(_HarborCodex):
         """
         return bool(os.environ.get("AWS_BEARER_TOKEN_BEDROCK", "").strip())
 
-    def _inject_bedrock_env(self) -> None:
-        """Forward Bedrock auth env into ``_extra_env`` so every exec inherits it.
+    def _inject_bedrock_env(self) -> dict[str, str]:
+        """Resolve the Bedrock auth env and return it for ``run`` to overlay.
 
-        ``BaseInstalledAgent._exec`` merges ``_extra_env`` into the environment of
-        every command (including the final ``codex exec``), so populating it here
-        is sufficient. Values already supplied via ``-ae`` take priority and are
-        never overwritten.
+        Harbor's ``Trial`` snapshots ``extra_env`` before ``run()`` and ``_exec``
+        no longer merges it, so values added here reach ``codex exec`` only
+        through the returned dict, which ``run`` applies with
+        ``environment.scoped_exec_env``. ``setdefault`` keeps values supplied via
+        ``-ae`` authoritative.
 
         Only the bearer token is forwarded for Bedrock auth — never the SigV4
         credential chain. In an aws-bench trial those AWS_* credentials belong to
@@ -104,29 +107,20 @@ class Codex(_HarborCodex):
         self._extra_env.setdefault("AWS_BEARER_TOKEN_BEDROCK", token)
         # Bedrock requires a Region. Honor -ae / host AWS_REGION, else default.
         self._extra_env.setdefault("AWS_REGION", os.environ.get("AWS_REGION", _DEFAULT_AWS_REGION))
+        return {k: self._extra_env[k] for k in ("AWS_BEARER_TOKEN_BEDROCK", "AWS_REGION")}
 
-    async def _write_bedrock_provider_config(self, environment: BaseEnvironment) -> None:
-        """Write ``model_provider = "amazon-bedrock"`` into the container config.
+    def _build_effective_config(self, openai_base_url: str | None = None) -> dict[str, Any]:
+        """Add ``model_provider = "amazon-bedrock"`` to the config harbor uploads.
 
-        Runs as its own step before harbor's setup. ``model_provider`` is a
-        top-level TOML key and harbor only ever *appends* (``>>``) to
-        ``config.toml`` (base_url, ``[mcp_servers.*]`` tables), so writing it
-        first guarantees it stays above every table header — a bare key written
-        after a table header would be mis-parsed as belonging to that table.
-
-        We ``mkdir -p`` the home ourselves so this does not depend on harbor's
-        own mkdir having run yet (it is idempotent with harbor's).
+        Harbor renders ``$CODEX_HOME/config.toml`` from this dict and uploads it
+        whole, so the provider has to be in the dict; a line appended to the file
+        beforehand would be overwritten. Harbor skips the upload for an empty
+        dict, and this key makes it non-empty in Bedrock mode.
         """
-        remote_codex_home = self._REMOTE_CODEX_HOME.as_posix()
-        provider_block = 'model_provider = "amazon-bedrock"\n'
-        await self.exec_as_agent(
-            environment,
-            command=(
-                f'mkdir -p "$CODEX_HOME" && '
-                f'echo {shlex.quote(provider_block)} >> "$CODEX_HOME/config.toml"'
-            ),
-            env={"CODEX_HOME": remote_codex_home},
-        )
+        config = super()._build_effective_config(openai_base_url)
+        if self._is_bedrock_mode():
+            config.setdefault("model_provider", "amazon-bedrock")
+        return config
 
     def _build_register_mcp_servers_command(self) -> str | None:
         r"""Write MCP server config to ``$CODEX_HOME/config.toml`` with correct keys.
@@ -168,13 +162,15 @@ class Codex(_HarborCodex):
     async def run(
         self, instruction: str, environment: BaseEnvironment, context: AgentContext
     ) -> None:
-        """Run the task, configuring Bedrock first when in Bedrock mode.
+        """Run the task, overlaying the Bedrock auth env when in Bedrock mode.
 
-        In Bedrock mode, forward auth env and write the provider config, then
-        defer to harbor's run (which appends the rest of config.toml).
+        The provider itself reaches ``config.toml`` through
+        ``_build_effective_config``, which harbor's run calls.
         """
         if self._is_bedrock_mode():
-            self._inject_bedrock_env()
-            await self._write_bedrock_provider_config(environment)
+            bedrock_env = self._inject_bedrock_env()
+            with environment.scoped_exec_env(bedrock_env):
+                await super().run(instruction, environment, context)
+            return
         # super().run is decorated with @with_prompt_template; do not re-decorate.
         await super().run(instruction, environment, context)

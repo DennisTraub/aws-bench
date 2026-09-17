@@ -1,17 +1,19 @@
-"""Tests for the Bedrock-aware Codex agent's MCP server registration.
+"""Tests for the Bedrock-aware Codex agent.
 
-These pin the corrected ``config.toml`` rendering: a stdio MCP server must emit
-``command`` and ``args`` as separate TOML keys (Harbor's base flattens them into
-one ``command`` string, so codex never starts the server), and every value must
-be escaped so it produces valid TOML.
+The MCP tests pin the corrected ``config.toml`` rendering: a stdio MCP server must
+emit ``command`` and ``args`` as separate TOML keys, and every value must be
+escaped so it produces valid TOML. The Bedrock tests pin what reaches the
+container in Bedrock mode: the bearer token and Region on the ``codex exec``
+process env, and ``model_provider`` in the ``config.toml`` harbor uploads.
 """
 
 from __future__ import annotations
 
+import contextlib
 import tomllib
 from pathlib import Path
 from typing import cast
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from harbor.models.task.config import MCPServerConfig
@@ -189,3 +191,126 @@ class TestCodexMcpServersMixed:
             "args": ["proxy@latest", "--skip-auth"],
         }
         assert parsed["mcp_servers"]["remote"] == {"url": "https://mcp.example.test/mcp"}
+
+
+# ── Bedrock mode: run() ──
+
+
+_BEARER = "bedrock-bearer-token-xyz"
+_BEDROCK_MODEL = "global.anthropic.claude-sonnet-5"
+
+
+@pytest.fixture(autouse=True)
+def _clear_bedrock_env(monkeypatch: pytest.MonkeyPatch):
+    """Start every test from a clean provider environment."""
+    for var in (
+        "AWS_BEARER_TOKEN_BEDROCK",
+        "AWS_REGION",
+        "OPENAI_API_KEY",
+        "OPENAI_BASE_URL",
+        "CODEX_AUTH_JSON_PATH",
+        "CODEX_FORCE_AUTH_JSON",
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+
+def _fresh_environment() -> MagicMock:
+    """A fake environment that applies ``scoped_exec_env`` overlays like harbor's.
+
+    harbor 0.22.0 delivers agent env through ``environment.scoped_exec_env`` and
+    its ``_merge_env`` applies the overlay over each exec's own ``env``
+    (per-exec env < scoped env). Uploaded files are recorded by remote path with
+    the content they had at upload time, since harbor deletes the local copy.
+    """
+    environment = MagicMock()
+    environment.default_user = None
+    overlays: list[dict] = []
+    calls: list[tuple[str, dict]] = []
+    uploads: dict[str, str] = {}
+
+    async def _exec(**kwargs):
+        merged: dict = dict(kwargs.get("env") or {})
+        for overlay in overlays:
+            merged.update(overlay)
+        calls.append((kwargs.get("command", ""), merged))
+        return MagicMock(return_code=0, stdout="", stderr="")
+
+    async def _upload_file(source_path, target_path):
+        uploads[str(target_path)] = Path(source_path).read_text()
+
+    @contextlib.contextmanager
+    def _scoped_exec_env(env: dict):
+        overlays.append(dict(env))
+        try:
+            yield
+        finally:
+            overlays.pop()
+
+    environment.exec = AsyncMock(side_effect=_exec)
+    environment.upload_file = AsyncMock(side_effect=_upload_file)
+    environment.scoped_exec_env = _scoped_exec_env
+    environment._recorded_calls = calls
+    environment._uploads = uploads
+    return environment
+
+
+def _codex_exec_env(environment: MagicMock) -> dict:
+    """Return the merged env of the final ``codex exec`` command."""
+    for command, env in environment._recorded_calls:
+        if "codex exec" in command:
+            return env
+    raise AssertionError("no `codex exec` command was executed")
+
+
+def _uploaded_config(environment: MagicMock) -> dict | None:
+    """Parse the ``config.toml`` harbor uploaded, or None when it uploaded none."""
+    for remote_path, content in environment._uploads.items():
+        if remote_path.endswith("config.toml"):
+            return tomllib.loads(content)
+    return None
+
+
+@pytest.mark.asyncio
+async def test_run_forwards_bearer_token_into_codex_exec(
+    logs_dir: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """In Bedrock mode the bearer token and Region reach the `codex exec` process env."""
+    monkeypatch.setenv("AWS_BEARER_TOKEN_BEDROCK", _BEARER)
+    monkeypatch.setenv("AWS_REGION", "us-west-2")
+    agent = Codex(logs_dir=logs_dir, model_name=_BEDROCK_MODEL)
+    environment = _fresh_environment()
+
+    await agent.run("do the task", environment, MagicMock())
+
+    env = _codex_exec_env(environment)
+    assert env.get("AWS_BEARER_TOKEN_BEDROCK") == _BEARER
+    assert env.get("AWS_REGION") == "us-west-2"
+
+
+@pytest.mark.asyncio
+async def test_run_bedrock_puts_model_provider_in_uploaded_config(
+    logs_dir: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """The provider rides harbor's own config upload, which replaces config.toml whole."""
+    monkeypatch.setenv("AWS_BEARER_TOKEN_BEDROCK", _BEARER)
+    agent = Codex(logs_dir=logs_dir, model_name=_BEDROCK_MODEL)
+    environment = _fresh_environment()
+
+    await agent.run("do the task", environment, MagicMock())
+
+    config = _uploaded_config(environment)
+    assert config is not None
+    assert config["model_provider"] == "amazon-bedrock"
+
+
+@pytest.mark.asyncio
+async def test_run_without_token_configures_no_provider(logs_dir: Path):
+    """Without a bearer token the adapter is a no-op over harbor's Codex."""
+    agent = Codex(logs_dir=logs_dir, model_name=_BEDROCK_MODEL)
+    environment = _fresh_environment()
+
+    await agent.run("do the task", environment, MagicMock())
+
+    assert "AWS_BEARER_TOKEN_BEDROCK" not in _codex_exec_env(environment)
+    config = _uploaded_config(environment)
+    assert config is None or "model_provider" not in config
