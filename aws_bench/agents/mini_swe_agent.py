@@ -18,7 +18,12 @@ class MiniSweAgent(_HarborMiniSweAgent):
     """MiniSweAgent with boto3 injected for Bedrock LLM calls."""
 
     async def install(self, environment: BaseEnvironment) -> None:
-        """Install mini-swe-agent with boto3 for Bedrock API calls."""
+        """Install mini-swe-agent with boto3 for Bedrock API calls.
+
+        The env-file source is guarded the way harbor's own install guards it:
+        Harbor 0.22.0 skips the uv installer when ``uv`` is already on PATH, so
+        ``$HOME/.local/bin/env`` exists only after a fresh bootstrap.
+        """
         await super().install(environment)
         # uv has no incremental inject, and the base fuses uv-bootstrap with the
         # tool install in one shell chain, so there's no seam to pass --with through.
@@ -36,7 +41,8 @@ class MiniSweAgent(_HarborMiniSweAgent):
         await self.exec_as_agent(
             environment,
             command=(
-                'source "$HOME/.local/bin/env" && '
+                'if [ -f "$HOME/.local/bin/env" ]; then source "$HOME/.local/bin/env"; fi && '
+                'export PATH="$HOME/.local/bin:$PATH" && '
                 f"uv tool install mini-swe-agent{version_spec} "
                 "--with boto3 --with 'litellm<=1.91.3' --force"
             ),
