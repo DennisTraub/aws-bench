@@ -13,10 +13,14 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from harbor.agents.installed.mini_swe_agent import MiniSweAgent as HarborMiniSweAgent
 
 from aws_bench.agents.mini_swe_agent import MiniSweAgent
 
 _BEDROCK_MODEL = "bedrock/us.anthropic.claude-sonnet-4-6"
+# The trial blanks the raw credential variables on the agent's env so the
+# container falls back to AWS_PROFILE; this is the entry that shadows the key.
+_EMPTY_GUARD = {"AWS_ACCESS_KEY_ID": ""}
 
 
 @pytest.fixture
@@ -40,6 +44,7 @@ def _clear_model_env(monkeypatch: pytest.MonkeyPatch):
         "AWS_REGION",
         "OPENAI_BASE_URL",
         "OPENAI_API_BASE",
+        "OPENAI_API_KEY",
     ):
         monkeypatch.delenv(var, raising=False)
 
@@ -168,3 +173,103 @@ async def test_reinstall_carries_the_pinned_version(logs_dir: Path, tmp_path: Pa
 
     assert result.returncode == 0, result.stderr
     assert "tool install mini-swe-agent==1.2.3 " in argv_log.read_text()
+
+
+# ── model_connection on Bedrock ──
+
+
+def _mini_swe_exec_env(environment: MagicMock) -> dict:
+    """Return the env of the ``mini-swe-agent`` command ``run()`` executed."""
+    for command, env in environment._recorded_calls:
+        if "mini-swe-agent --yolo" in command:
+            return env
+    raise AssertionError("no `mini-swe-agent` command was executed")
+
+
+def test_bedrock_restores_the_host_generic_key_over_the_empty_guard(
+    logs_dir: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """On harbor 0.22.0 the agent env resolves first, so the empty guard shadows a host key."""
+    monkeypatch.setenv("MSWEA_API_KEY", "model-key")
+    agent = MiniSweAgent(logs_dir=logs_dir, model_name=_BEDROCK_MODEL, extra_env=_EMPTY_GUARD)
+
+    access = agent.model_connection
+
+    assert access.api_key == "model-key"
+    assert access.env["MSWEA_API_KEY"] == "model-key"
+
+
+def test_bedrock_explicit_generic_key_beats_the_host_value(
+    logs_dir: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("MSWEA_API_KEY", "host-key")
+    agent = MiniSweAgent(
+        logs_dir=logs_dir,
+        model_name=_BEDROCK_MODEL,
+        extra_env={**_EMPTY_GUARD, "MSWEA_API_KEY": "explicit"},
+    )
+
+    access = agent.model_connection
+
+    assert access.api_key == "explicit"
+    assert access.env["MSWEA_API_KEY"] == "explicit"
+
+
+def test_bedrock_explicitly_empty_generic_key_is_left_as_harbor_resolves_it(
+    logs_dir: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """An explicit ``-ae MSWEA_API_KEY=`` resolves first; harbor already writes the empty value."""
+    monkeypatch.setenv("MSWEA_API_KEY", "host-key")
+    extra_env = {**_EMPTY_GUARD, "MSWEA_API_KEY": ""}
+    agent = MiniSweAgent(logs_dir=logs_dir, model_name=_BEDROCK_MODEL, extra_env=extra_env)
+    harbor_agent = HarborMiniSweAgent(
+        logs_dir=logs_dir, model_name=_BEDROCK_MODEL, extra_env=extra_env
+    )
+
+    access = agent.model_connection
+
+    assert access.api_key == ""
+    assert access.env["MSWEA_API_KEY"] == ""
+    assert access == harbor_agent.model_connection
+
+
+def test_bedrock_without_any_generic_key_is_unchanged_from_harbor(logs_dir: Path):
+    agent = MiniSweAgent(logs_dir=logs_dir, model_name=_BEDROCK_MODEL, extra_env=_EMPTY_GUARD)
+    harbor_agent = HarborMiniSweAgent(
+        logs_dir=logs_dir, model_name=_BEDROCK_MODEL, extra_env=_EMPTY_GUARD
+    )
+
+    access = agent.model_connection
+
+    assert access.api_key == ""
+    assert access == harbor_agent.model_connection
+
+
+def test_non_bedrock_provider_is_unchanged_from_harbor(
+    logs_dir: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """The restore is narrow: an OpenAI model with the same guard resolves as harbor does."""
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-key")
+    agent = MiniSweAgent(logs_dir=logs_dir, model_name="openai/gpt-5", extra_env=_EMPTY_GUARD)
+    harbor_agent = HarborMiniSweAgent(
+        logs_dir=logs_dir, model_name="openai/gpt-5", extra_env=_EMPTY_GUARD
+    )
+
+    access = agent.model_connection
+
+    assert access.api_key == "openai-key"
+    assert access == harbor_agent.model_connection
+
+
+@pytest.mark.asyncio
+async def test_run_passes_the_restored_key_to_mini_swe_agent(
+    logs_dir: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Through ``run()``, the launched mini-swe-agent sees the host key despite the guard."""
+    monkeypatch.setenv("MSWEA_API_KEY", "model-key")
+    agent = MiniSweAgent(logs_dir=logs_dir, model_name=_BEDROCK_MODEL, extra_env=_EMPTY_GUARD)
+    environment = _fresh_environment()
+
+    await agent.run("do the task", environment, MagicMock())
+
+    assert _mini_swe_exec_env(environment)["MSWEA_API_KEY"] == "model-key"
