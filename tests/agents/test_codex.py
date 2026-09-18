@@ -210,6 +210,7 @@ def _clear_bedrock_env(monkeypatch: pytest.MonkeyPatch):
         "OPENAI_BASE_URL",
         "CODEX_AUTH_JSON_PATH",
         "CODEX_FORCE_AUTH_JSON",
+        "CODEX_HOME",
     ):
         monkeypatch.delenv(var, raising=False)
 
@@ -270,6 +271,14 @@ def _uploaded_config(environment: MagicMock) -> dict | None:
     return None
 
 
+def _uploaded_config_path(environment: MagicMock) -> str | None:
+    """The remote path the ``config.toml`` was uploaded to, or None when none was."""
+    for remote_path in environment._uploads:
+        if remote_path.endswith("config.toml"):
+            return remote_path
+    return None
+
+
 @pytest.mark.asyncio
 async def test_run_forwards_bearer_token_into_codex_exec(
     logs_dir: Path, monkeypatch: pytest.MonkeyPatch
@@ -314,3 +323,113 @@ async def test_run_without_token_configures_no_provider(logs_dir: Path):
     assert "AWS_BEARER_TOKEN_BEDROCK" not in _codex_exec_env(environment)
     config = _uploaded_config(environment)
     assert config is None or "model_provider" not in config
+
+
+# ── Bedrock mode: config.toml upload (escaping and CODEX_HOME) ──
+
+_DEFAULT_CONFIG_PATH = "/tmp/codex-home/config.toml"
+
+
+async def _run_bedrock_with_args(logs_dir: Path, args: list[str], **agent_kwargs) -> MagicMock:
+    """Run a Bedrock-mode trial with one stdio MCP server carrying ``args``."""
+    agent = Codex(logs_dir=logs_dir, model_name=_BEDROCK_MODEL, **agent_kwargs)
+    agent.mcp_servers = [_stdio_server("aws-mcp", "uvx", args)]
+    environment = _fresh_environment()
+    await agent.run("do the task", environment, MagicMock())
+    return environment
+
+
+@pytest.mark.asyncio
+async def test_upload_keeps_a_literal_backslash_x_sequence(
+    logs_dir: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """``toml.dumps`` turns the four characters backslash-x-4-1 into ``A``; this keeps them."""
+    monkeypatch.setenv("AWS_BEARER_TOKEN_BEDROCK", _BEARER)
+    literal = "\\x41"
+
+    environment = await _run_bedrock_with_args(logs_dir, [literal])
+
+    config = _uploaded_config(environment)
+    assert config is not None
+    assert config["mcp_servers"]["aws-mcp"]["args"] == [literal]
+
+
+@pytest.mark.asyncio
+async def test_upload_survives_a_backspace_character(
+    logs_dir: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """``toml.dumps`` raises ``IndexError`` on a leading backspace and mangles a later one."""
+    monkeypatch.setenv("AWS_BEARER_TOKEN_BEDROCK", _BEARER)
+    args = ["\bkey", "tab\bkey"]
+
+    environment = await _run_bedrock_with_args(logs_dir, args)
+
+    config = _uploaded_config(environment)
+    assert config is not None
+    assert config["mcp_servers"]["aws-mcp"]["args"] == args
+
+
+@pytest.mark.asyncio
+async def test_upload_round_trips_quote_and_backslash(
+    logs_dir: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("AWS_BEARER_TOKEN_BEDROCK", _BEARER)
+    args = ['arg-with-"quote"', "path\\with\\backslash", 'both "\\']
+
+    environment = await _run_bedrock_with_args(logs_dir, args)
+
+    config = _uploaded_config(environment)
+    assert config is not None
+    assert config["mcp_servers"]["aws-mcp"]["args"] == args
+
+
+@pytest.mark.asyncio
+async def test_upload_lands_in_the_agent_env_codex_home(
+    logs_dir: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A ``-ae CODEX_HOME`` overlay moves where codex reads, so the upload moves with it."""
+    monkeypatch.setenv("AWS_BEARER_TOKEN_BEDROCK", _BEARER)
+
+    environment = await _run_bedrock_with_args(
+        logs_dir, ["--skip-auth"], extra_env={"CODEX_HOME": "/tmp/custom-codex"}
+    )
+
+    assert _uploaded_config_path(environment) == "/tmp/custom-codex/config.toml"
+    assert _DEFAULT_CONFIG_PATH not in environment._uploads
+
+
+@pytest.mark.asyncio
+async def test_host_codex_home_does_not_relocate_the_upload(
+    logs_dir: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Only the agent env reaches the container, so a host ``CODEX_HOME`` must not move the file."""
+    monkeypatch.setenv("AWS_BEARER_TOKEN_BEDROCK", _BEARER)
+    monkeypatch.setenv("CODEX_HOME", "/somewhere/on/host")
+
+    environment = await _run_bedrock_with_args(logs_dir, ["--skip-auth"])
+
+    assert _uploaded_config_path(environment) == _DEFAULT_CONFIG_PATH
+
+
+@pytest.mark.asyncio
+async def test_empty_agent_env_codex_home_keeps_the_default_path(
+    logs_dir: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("AWS_BEARER_TOKEN_BEDROCK", _BEARER)
+
+    environment = await _run_bedrock_with_args(
+        logs_dir, ["--skip-auth"], extra_env={"CODEX_HOME": ""}
+    )
+
+    assert _uploaded_config_path(environment) == _DEFAULT_CONFIG_PATH
+
+
+@pytest.mark.asyncio
+async def test_openai_mode_without_servers_or_base_url_uploads_nothing(logs_dir: Path):
+    """The empty-dict early return is preserved: nothing to render means no upload."""
+    agent = Codex(logs_dir=logs_dir, model_name="gpt-5")
+    environment = _fresh_environment()
+
+    await agent.run("do the task", environment, MagicMock())
+
+    assert _uploaded_config_path(environment) is None

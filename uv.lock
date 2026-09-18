@@ -204,6 +204,7 @@ dependencies = [
     { name = "python-dotenv" },
     { name = "shortuuid" },
     { name = "tenacity" },
+    { name = "toml" },
     { name = "typer" },
 ]
 
@@ -252,6 +253,7 @@ requires-dist = [
     { name = "requests-auth-aws-sigv4", marker = "extra == 'mlflow'" },
     { name = "shortuuid", specifier = ">=1.0.13" },
     { name = "tenacity", specifier = ">=9.1.0" },
+    { name = "toml", specifier = ">=0.10.2" },
     { name = "typer", specifier = ">=0.15.0" },
 ]
 provides-extras = ["mlflow"]

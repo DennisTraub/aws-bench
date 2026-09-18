@@ -3,7 +3,7 @@
 Harbor's built-in ``Codex`` agent only knows how to talk to OpenAI: it writes
 ``OPENAI_API_KEY`` into the container and runs ``codex exec`` with no provider
 configured, so codex falls back to its default OpenAI provider. To drive Codex
-against Amazon Bedrock, two things are missing, and this subclass fills both:
+against Amazon Bedrock, three things are missing, and this subclass fills all three:
 
 1. ``model_provider = "amazon-bedrock"`` must be present in the *container's*
    ``$CODEX_HOME/config.toml``, which harbor renders and uploads from the
@@ -11,6 +11,11 @@ against Amazon Bedrock, two things are missing, and this subclass fills both:
    of which env vars are set. This cannot be supplied via ``-ae``.
 2. The Bedrock auth env (``AWS_BEARER_TOKEN_BEDROCK`` + ``AWS_REGION``) must be
    forwarded from the host into the codex subprocess. Harbor's Codex does not.
+3. The uploaded ``config.toml`` must be valid TOML in the directory codex reads.
+   Harbor renders it with ``toml.dumps``, which rewrites backslash-x sequences and
+   control characters in string values. It also uploads the file to a fixed path
+   even when a ``-ae CODEX_HOME`` overlay makes codex read elsewhere. The upload
+   override escapes every string and follows the agent env's ``CODEX_HOME``.
 
 Bedrock mode is auto-detected from a non-empty ``AWS_BEARER_TOKEN_BEDROCK`` in
 the environment. When that token is absent this behaves exactly like harbor's
@@ -24,8 +29,10 @@ from __future__ import annotations
 
 import os
 import shlex
+from pathlib import PurePosixPath
 from typing import Any
 
+import toml
 from harbor.agents.installed.codex import Codex as _HarborCodex
 from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
@@ -121,6 +128,32 @@ class Codex(_HarborCodex):
         if self._is_bedrock_mode():
             config.setdefault("model_provider", "amazon-bedrock")
         return config
+
+    async def _upload_effective_config(
+        self, environment: BaseEnvironment, config: dict[str, Any], remote_path: str
+    ) -> None:
+        r"""Upload ``config.toml`` with every string escaped, to the home codex reads.
+
+        Harbor 0.22.0 renders the file with ``toml.dumps``, whose ``_dump_str`` turns
+        a literal ``\x41`` into ``A`` and raises ``IndexError`` on a leading backspace.
+        It also uploads to the fixed ``_REMOTE_CODEX_HOME`` while the trial applies
+        ``extra_env`` as the container's exec overlay, so under ``-ae CODEX_HOME``
+        every ``$CODEX_HOME`` reference in the container resolves elsewhere. The host
+        environment never reaches the container, so only ``extra_env`` decides the path.
+        """
+        if not config:
+            return
+        codex_home = self.extra_env.get("CODEX_HOME")
+        if codex_home:
+            remote_path = (PurePosixPath(codex_home) / "config.toml").as_posix()
+        encoder = toml.TomlEncoder()
+        encoder.dump_funcs[str] = _toml_basic_string
+        await self._upload_config_text(
+            environment,
+            content=toml.dumps(config, encoder=encoder),
+            remote_path=remote_path,
+            filename="config.toml",
+        )
 
     def _build_register_mcp_servers_command(self) -> str | None:
         r"""Write MCP server config to ``$CODEX_HOME/config.toml`` with correct keys.
