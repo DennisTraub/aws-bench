@@ -468,24 +468,30 @@ class AwsBenchTrial:
 
     @classmethod
     async def create(cls, config: TrialConfig) -> AwsBenchSingleStepTrial:
-        """Build the concrete single-step trial, refusing multi-step AWS tasks."""
-        task = await AwsBenchTask.from_config(config.task, config.extra_instruction_paths)
+        """Download the task once, build the concrete single-step trial, refuse multi-step."""
+        download_result = await cls._resolve_download_result(config)
+        task = AwsBenchTask(download_result.path, config.extra_instruction_paths)
         if task.has_steps:
             raise NotImplementedError(
                 "multi-step AWS tasks are not yet supported (per-step pre/post-invoke "
                 "credentialing is undefined)."
             )
-        download_result = await cls._resolve_download_result(config)
         return AwsBenchSingleStepTrial(config, _task=task, _task_download_result=download_result)
 
     @staticmethod
     async def _resolve_download_result(config: TrialConfig) -> TaskDownloadResult:
-        """The ``TaskDownloadResult`` harbor's trial lock records for this task.
+        """The trial's one task download; harbor's trial lock records the result.
 
         Mirrors ``Trial._load_task``. A local task resolves to its own path without
-        I/O. A git task repeats the download ``AwsBenchTask.from_config`` made, which
-        is a cache hit for a sha-pinned ref with ``overwrite`` off.
+        I/O; a git task downloads under the config's ``download_dir`` or
+        ``TASK_CACHE_DIR``. Package references are refused (only git/local are
+        supported).
         """
+        if config.task.is_package_task():
+            raise NotImplementedError(
+                "aws-bench does not support package task references; got "
+                f"{config.task.get_task_id()}."
+            )
         batch = await TaskClient().download_tasks(
             task_ids=[config.task.get_task_id()],
             overwrite=config.task.overwrite,

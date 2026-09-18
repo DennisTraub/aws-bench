@@ -10,6 +10,7 @@ are faked down to what the overrides touch.
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -20,7 +21,6 @@ from harbor.trial.single_step import SingleStepTrial
 from harbor.trial.trial import Trial
 
 from aws_bench.dataset.models import RoleType, ScriptType
-from aws_bench.dataset.task_config import AwsBenchTask
 from aws_bench.exceptions import AccountContaminatedError
 from aws_bench.task import aws_trial
 from aws_bench.task.aws_trial import AwsBenchSingleStepTrial, AwsBenchTrial
@@ -150,40 +150,99 @@ def _make_trial(
 # --- create dispatch -------------------------------------------------------
 
 
-@pytest.mark.asyncio
-async def test_create_dispatches_single_step(mocker):
-    task = SimpleNamespace(has_steps=False)
-    mocker.patch.object(AwsBenchTask, "from_config", AsyncMock(return_value=task))
-    # Patch the base init out to skip the heavy Docker / agent-factory chain.
-    mocker.patch.object(SingleStepTrial, "__init__", lambda self, config, **kwargs: None)
+def _patch_task_client(mocker, results):
+    """Replace the TaskClient aws_trial constructs; return its download_tasks mock."""
+    download_tasks = AsyncMock(return_value=SimpleNamespace(results=results))
     mocker.patch.object(
-        AwsBenchTrial, "_resolve_download_result", AsyncMock(return_value=MagicMock())
+        aws_trial, "TaskClient", return_value=SimpleNamespace(download_tasks=download_tasks)
     )
-    trial = await AwsBenchTrial.create(MagicMock())
-    assert isinstance(trial, AwsBenchSingleStepTrial)
+    return download_tasks
+
+
+def _capture_trial_init(mocker) -> dict:
+    """Skip the heavy Docker / agent-factory init and record the kwargs create passes."""
+    captured: dict = {}
+
+    def fake_init(self, config, **kwargs):
+        captured.update(kwargs)
+
+    mocker.patch.object(SingleStepTrial, "__init__", fake_init)
+    return captured
 
 
 @pytest.mark.asyncio
-async def test_create_multi_step_raises_not_implemented(mocker):
-    task = SimpleNamespace(has_steps=True)
-    mocker.patch.object(AwsBenchTask, "from_config", AsyncMock(return_value=task))
+async def test_create_dispatches_single_step(tmp_path, mocker):
+    task = SimpleNamespace(has_steps=False)
+    task_cls = mocker.patch.object(aws_trial, "AwsBenchTask", return_value=task)
+    _patch_task_client(mocker, [SimpleNamespace(path=tmp_path)])
+    _capture_trial_init(mocker)
+    config = TrialConfig(task=TaskConfig(path=tmp_path), extra_instruction_paths=[])
+    trial = await AwsBenchTrial.create(config)
+    assert isinstance(trial, AwsBenchSingleStepTrial)
+    task_cls.assert_called_once_with(tmp_path, [])
+
+
+@pytest.mark.asyncio
+async def test_create_multi_step_raises_not_implemented(tmp_path, mocker):
+    mocker.patch.object(aws_trial, "AwsBenchTask", return_value=SimpleNamespace(has_steps=True))
+    download_tasks = _patch_task_client(mocker, [SimpleNamespace(path=tmp_path)])
     with pytest.raises(NotImplementedError, match="multi-step"):
-        await AwsBenchTrial.create(MagicMock())
+        await AwsBenchTrial.create(TrialConfig(task=TaskConfig(path=tmp_path)))
+    download_tasks.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_create_downloads_a_git_task_once(tmp_path, mocker):
+    """One download supplies the task and the lock record, so a branch ref is resolved once."""
+    task_cls = mocker.patch.object(
+        aws_trial, "AwsBenchTask", return_value=SimpleNamespace(has_steps=False)
+    )
+    download_result = SimpleNamespace(path=tmp_path / "task")
+    download_tasks = _patch_task_client(mocker, [download_result])
+    captured = _capture_trial_init(mocker)
+    extra = [tmp_path / "extra.md"]
+    config = TrialConfig(
+        task=TaskConfig(
+            git_url="https://example.com/tasks.git", git_commit_id="main", path=Path("tasks/x")
+        ),
+        extra_instruction_paths=extra,
+    )
+    await AwsBenchTrial.create(config)
+    download_tasks.assert_awaited_once()
+    assert captured["_task_download_result"] is download_result
+    task_cls.assert_called_once_with(download_result.path, extra)
+
+
+@pytest.mark.asyncio
+async def test_create_local_task_downloads_once_to_its_own_path(tmp_path, mocker):
+    """Harbor's local branch returns the configured path verbatim, through the same one call."""
+    mocker.patch.object(aws_trial, "AwsBenchTask", return_value=SimpleNamespace(has_steps=False))
+    download_tasks = _patch_task_client(mocker, [SimpleNamespace(path=tmp_path)])
+    captured = _capture_trial_init(mocker)
+    await AwsBenchTrial.create(TrialConfig(task=TaskConfig(path=tmp_path)))
+    download_tasks.assert_awaited_once()
+    assert captured["_task_download_result"].path == tmp_path
 
 
 @pytest.mark.asyncio
 async def test_resolve_download_result_uses_task_settings(tmp_path, mocker):
     expected = SimpleNamespace(path=tmp_path)
-    download_tasks = AsyncMock(return_value=SimpleNamespace(results=[expected]))
-    mocker.patch.object(
-        aws_trial, "TaskClient", return_value=SimpleNamespace(download_tasks=download_tasks)
-    )
+    download_tasks = _patch_task_client(mocker, [expected])
     config = TrialConfig(task=TaskConfig(path=tmp_path, overwrite=True))
     result = await AwsBenchTrial._resolve_download_result(config)
     assert result is expected
     download_tasks.assert_awaited_once_with(
         task_ids=[config.task.get_task_id()], overwrite=True, output_dir=aws_trial.TASK_CACHE_DIR
     )
+
+
+@pytest.mark.asyncio
+async def test_resolve_download_result_refuses_package_tasks(mocker):
+    download_tasks = _patch_task_client(mocker, [])
+    config = TrialConfig(task=TaskConfig(name="harbor/hello-world"))
+    with pytest.raises(NotImplementedError, match="package"):
+        await AwsBenchTrial._resolve_download_result(config)
+    download_tasks.assert_not_awaited()
 
 
 # --- placeholder substitution into the instruction ------------------------
